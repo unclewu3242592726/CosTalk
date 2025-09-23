@@ -1,0 +1,14 @@
+syntax = "v1"
+
+info (
+	title:   "CosTalk API"
+	desc:    "AI 角色扮演语音对话平台 - 主API入口"
+	author:  "CosTalk Team"
+	version: "v1.0"
+)
+
+// 导入各个业务模块的 API 定义
+import "health.api"
+import "role.api"
+import "chat.api"
+import "service.api"

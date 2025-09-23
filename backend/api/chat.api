@@ -1,0 +1,50 @@
+syntax = "v1"
+
+// 对话聊天 API
+info (
+	title:   "Chat API"
+	desc:    "AI 对话聊天接口"
+	version: "v1.0"
+)
+
+// 消息结构
+type ChatMessage {
+	Role    string `json:"role"` // system|user|assistant
+	Content string `json:"content"`
+}
+
+// 对话请求
+type ChatRequest {
+	RoleID    string                 `json:"roleId"`
+	Model     string                 `json:"model,optional"`
+	Messages  []ChatMessage          `json:"messages,optional"`
+	TTSConfig map[string]interface{} `json:"ttsConfig,optional"`
+}
+
+// 对话响应
+type ChatResponse {
+	Code    int      `json:"code"`
+	Message string   `json:"message"`
+	Data    ChatData `json:"data"`
+}
+
+type ChatData {
+	ConversationID string `json:"conversationId"`
+	Message        string `json:"message"`
+}
+
+// WebSocket 事件帧
+type WSFrame {
+	Type    string      `json:"type"`
+	Seq     int         `json:"seq,optional"`
+	Content interface{} `json:"content,optional"`
+}
+
+@server(
+	group: chat
+)
+service costalk-api {
+	// WebSocket 聊天（实际使用 WebSocket 升级，不通过 HTTP）
+	@handler chatStream
+	get /v1/chat/stream returns (ChatResponse)
+}

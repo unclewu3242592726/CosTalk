@@ -1,0 +1,33 @@
+syntax = "v1"
+
+// 角色管理 API
+info (
+	title:   "Role API"
+	desc:    "AI 角色管理接口"
+	version: "v1.0"
+)
+
+// 角色信息
+type Role {
+	ID          string            `json:"id"`
+	Name        string            `json:"name"`
+	Avatar      string            `json:"avatar"`
+	Description string            `json:"description"`
+	Skills      []string          `json:"skills"`
+	TTSDefault  map[string]string `json:"ttsDefault"`
+}
+
+type RolesResponse {
+	Code    int    `json:"code"`
+	Message string `json:"message"`
+	Data    []Role `json:"data"`
+}
+
+@server(
+	group: role
+)
+service costalk-api {
+	// 获取角色列表
+	@handler getRoles
+	get /v1/roles returns (RolesResponse)
+}

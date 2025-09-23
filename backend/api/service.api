@@ -1,0 +1,48 @@
+syntax = "v1"
+
+// 服务注册和发现 API
+info (
+	title:   "Service API"
+	desc:    "服务注册和发现接口"
+	version: "v1.0"
+)
+
+// Provider 信息
+type ProviderInfo {
+	Name        string            `json:"name"`
+	Type        string            `json:"type"` // llm|asr|tts|moderation
+	Status      string            `json:"status"` // online|offline|error
+	Capabilities []string         `json:"capabilities,optional"`
+	Config      map[string]string `json:"config,optional"`
+}
+
+// 服务列表响应
+type ServiceListResponse {
+	Code    int            `json:"code"`
+	Message string         `json:"message"`
+	Data    []ProviderInfo `json:"data"`
+}
+
+// 服务状态响应
+type ServiceStatusResponse {
+	Code    int          `json:"code"`
+	Message string       `json:"message"`
+	Data    ProviderInfo `json:"data"`
+}
+
+@server(
+	group: service
+)
+service costalk-api {
+	// 获取所有可用服务列表
+	@handler getServices
+	get /v1/services returns (ServiceListResponse)
+	
+	// 获取特定类型的服务列表
+	@handler getServicesByType
+	get /v1/services/:type returns (ServiceListResponse)
+	
+	// 获取特定服务的状态
+	@handler getServiceStatus
+	get /v1/services/:type/:name returns (ServiceStatusResponse)
+}

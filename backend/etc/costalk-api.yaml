@@ -1,0 +1,17 @@
+Name: costalk-api
+Host: 0.0.0.0
+Port: 8888
+
+# Provider 配置
+Providers:
+  Qwen:
+    APIKey: ""
+    BaseURL: "https://dashscope.aliyuncs.com/compatible-mode/v1"
+  Iflytek:
+    AppID: ""
+    APISecret: ""
+    APIKey: ""
+  Qiniu:
+    AccessKey: "-5f5FU1VWWKlnEqQOSVHY_nrMT2HIDgwOS6Mqq3B"
+    SecretKey: "nN4M-_c_ummupnZPNc8dmgiCri9C29fVou2_t0eN"
+    APIKey: "sk-ef0b7188be3e7cc3744c135ffc6fa42e6dc24a67d1a8e723560808dbed28a5dc"

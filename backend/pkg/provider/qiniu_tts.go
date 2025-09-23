@@ -63,7 +63,7 @@ func NewQiniuTTSProvider(apiKey string) *QiniuTTSProvider {
 	return &QiniuTTSProvider{
 		apiKey:     apiKey,
 		baseURL:    "https://openai.qiniu.com/v1",
-		wsURL:      "wss://openai.qiniu.com/v1/voice/tts",
+		wsURL:      "wss://api.qnaigc.com/v1/voice/tts", // 使用官方示例的URL
 		httpClient: &http.Client{Timeout: 30 * time.Second},
 	}
 }

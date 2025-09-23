@@ -8,9 +8,9 @@ Providers:
     APIKey: ""
     BaseURL: "https://dashscope.aliyuncs.com/compatible-mode/v1"
   Iflytek:
-    AppID: ""
-    APISecret: ""
-    APIKey: ""
+    AppID: "c935bd49"  # 请填写你的讯飞AppID
+    APISecret: "ZTMzYTY0ZWY5ZGVjOGViNzdjNWFmZmE4"  # 请填写你的讯飞APISecret  
+    APIKey: "5ae81801ecc84f44158488f95fad191e"  # 请填写你的讯飞APIKey
   Qiniu:
     AccessKey: "-5f5FU1VWWKlnEqQOSVHY_nrMT2HIDgwOS6Mqq3B"
     SecretKey: "nN4M-_c_ummupnZPNc8dmgiCri9C29fVou2_t0eN"

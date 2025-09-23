@@ -120,13 +120,18 @@
             min-width: 200px;
         }
         
+        .config-group.full-width {
+            flex: 100%;
+            width: 100%;
+        }
+        
         label {
             display: block;
             margin-bottom: 5px;
             font-weight: bold;
         }
         
-        select, input {
+        select, input, textarea {
             width: 100%;
             padding: 10px;
             border: none;
@@ -136,12 +141,18 @@
             backdrop-filter: blur(5px);
         }
         
+        textarea {
+            resize: vertical;
+            min-height: 60px;
+            font-family: inherit;
+        }
+        
         select option {
             background: #333;
             color: white;
         }
         
-        input::placeholder {
+        input::placeholder, textarea::placeholder {
             color: rgba(255, 255, 255, 0.7);
         }
         
@@ -245,6 +256,7 @@
                 <div class="config-group">
                     <label for="asrProvider">ASR 提供商:</label>
                     <select id="asrProvider">
+                        <option value="iflytek" selected>科大讯飞 ASR</option>
                         <option value="qiniu">七牛云 ASR</option>
                     </select>
                 </div>
@@ -268,6 +280,27 @@
                     <label for="speed">语速:</label>
                     <input type="range" id="speed" min="0.5" max="2.0" step="0.1" value="1.0">
                     <span id="speedValue">1.0</span>
+                </div>
+            </div>
+            
+            <div class="config-row">
+                <div class="config-group full-width">
+                    <label for="rolePreset">角色设定:</label>
+                    <select id="rolePreset">
+                        <option value="friendly_assistant">友好助手</option>
+                        <option value="cute_girl">可爱女孩</option>
+                        <option value="professional">专业顾问</option>
+                        <option value="creative_writer">创意作家</option>
+                        <option value="teacher">耐心老师</option>
+                        <option value="custom">自定义...</option>
+                    </select>
+                </div>
+            </div>
+            
+            <div class="config-row" id="customRoleRow" style="display: none;">
+                <div class="config-group full-width">
+                    <label for="customRole">自定义角色:</label>
+                    <textarea id="customRole" placeholder="输入你的角色设定prompt..." rows="3"></textarea>
                 </div>
             </div>
         </div>
@@ -298,7 +331,8 @@
                 this.audioChunks = [];
                 this.isRecording = false;
                 this.audioContext = null;
-                this.currentAudio = null;
+                this.audioQueue = [];
+                this.isPlaying = false;
                 
                 this.initializeElements();
                 this.attachEventListeners();
@@ -315,6 +349,9 @@
                 this.conversationEl = document.getElementById('conversation');
                 this.speedEl = document.getElementById('speed');
                 this.speedValueEl = document.getElementById('speedValue');
+                this.rolePresetEl = document.getElementById('rolePreset');
+                this.customRoleRowEl = document.getElementById('customRoleRow');
+                this.customRoleEl = document.getElementById('customRole');
             }
             
             attachEventListeners() {
@@ -325,6 +362,29 @@
                 this.speedEl.addEventListener('input', (e) => {
                     this.speedValueEl.textContent = e.target.value;
                 });
+                this.rolePresetEl.addEventListener('change', (e) => {
+                    this.toggleCustomRole(e.target.value === 'custom');
+                });
+            }
+            
+            toggleCustomRole(show) {
+                this.customRoleRowEl.style.display = show ? 'flex' : 'none';
+            }
+            
+            getRolePrompt() {
+                const rolePresets = {
+                    'friendly_assistant': '你是一个友好、热情的AI助手。你总是乐于助人，说话温和有礼，喜欢用温暖的语气和适当的表情符号与用户交流。',
+                    'cute_girl': '你是一个可爱活泼的女孩，说话甜美，喜欢用"哟～"、"呀～"等可爱的语气词，偶尔撒娇，总是充满正能量，让人感到开心。',
+                    'professional': '你是一个专业、严谨的顾问。你说话简洁明了，逻辑清晰，总是提供准确、有用的建议，展现出高度的专业素养。',
+                    'creative_writer': '你是一个富有创意的作家，想象力丰富，语言优美生动，善于用比喻和修辞，总能给出独特有趣的观点。',
+                    'teacher': '你是一个耐心的老师，善于解释复杂的概念，总是循循善诱，用简单易懂的方式帮助别人学习和理解。'
+                };
+                
+                const selectedRole = this.rolePresetEl.value;
+                if (selectedRole === 'custom') {
+                    return this.customRoleEl.value || rolePresets['friendly_assistant'];
+                }
+                return rolePresets[selectedRole] || rolePresets['friendly_assistant'];
             }
             
             async toggleConnection() {
@@ -388,13 +448,13 @@
                         ttsProvider: document.getElementById('ttsProvider').value,
                         voice: document.getElementById('voice').value,
                         speed: parseFloat(document.getElementById('speed').value),
-                        role: 'assistant'
+                        role: this.getRolePrompt()
                     },
                     timestamp: Date.now()
                 };
                 
                 this.sendMessage(config);
-                this.log('已发送配置信息', 'info');
+                this.log(`已发送配置信息，角色: ${this.rolePresetEl.options[this.rolePresetEl.selectedIndex].text}`, 'info');
             }
             
             sendMessage(message) {
@@ -538,9 +598,14 @@
                             break;
                             
                         case 'tts':
-                            if (message.content && message.content.audio_data) {
-                                this.playAudio(message.content.audio_data, message.content.format);
-                                this.log('收到TTS音频数据', 'success');
+                            if (message.content && (message.content.audio_data || message.content.audio)) {
+                                const audioData = message.content.audio_data || message.content.audio;
+                                const format = message.content.format || 'mp3';
+                                const sequence = message.content.sequence || 0;
+                                this.playAudio(audioData, format);
+                                this.log(`收到TTS音频数据，序列号: ${sequence}, 格式: ${format}`, 'success');
+                            } else {
+                                this.log(`TTS消息格式错误: ${JSON.stringify(message.content)}`, 'error');
                             }
                             break;
                             
@@ -559,38 +624,105 @@
             
             async playAudio(audioData, format) {
                 try {
-                    // 停止当前播放的音频
-                    if (this.currentAudio) {
-                        this.currentAudio.pause();
-                    }
+                    this.log(`准备播放音频，数据类型: ${typeof audioData}, 格式: ${format}`, 'info');
                     
                     let audioBlob;
                     if (Array.isArray(audioData)) {
                         // 如果是数组，转换为 Uint8Array
                         audioBlob = new Blob([new Uint8Array(audioData)], { type: `audio/${format}` });
+                        this.log(`处理数组音频数据，长度: ${audioData.length}`, 'info');
                     } else if (typeof audioData === 'string') {
                         // 如果是 base64 字符串
+                        this.log(`处理base64音频数据，长度: ${audioData.length}`, 'info');
                         const binaryString = atob(audioData);
                         const bytes = new Uint8Array(binaryString.length);
                         for (let i = 0; i < binaryString.length; i++) {
                             bytes[i] = binaryString.charCodeAt(i);
                         }
                         audioBlob = new Blob([bytes], { type: `audio/${format}` });
+                    } else {
+                        this.log(`不支持的音频数据类型: ${typeof audioData}`, 'error');
+                        return;
                     }
                     
-                    const audioUrl = URL.createObjectURL(audioBlob);
-                    this.currentAudio = new Audio(audioUrl);
+                    // 将音频添加到队列
+                    this.audioQueue.push(audioBlob);
+                    this.log(`音频块添加到队列，队列长度: ${this.audioQueue.length}, Blob大小: ${audioBlob.size} bytes`, 'info');
                     
-                    this.currentAudio.onended = () => {
-                        URL.revokeObjectURL(audioUrl);
-                    };
-                    
-                    await this.currentAudio.play();
-                    this.log('开始播放TTS音频', 'success');
+                    // 如果当前没有播放，开始播放队列
+                    if (!this.isPlaying) {
+                        this.playAudioQueue();
+                    }
                     
                 } catch (error) {
-                    this.log(`播放音频失败: ${error.message}`, 'error');
+                    this.log(`处理音频失败: ${error.message}`, 'error');
+                    console.error('Audio processing error:', error);
                 }
+            }
+            
+            async playAudioQueue() {
+                if (this.isPlaying || this.audioQueue.length === 0) {
+                    this.log(`播放队列检查: isPlaying=${this.isPlaying}, queueLength=${this.audioQueue.length}`, 'info');
+                    return;
+                }
+                
+                this.isPlaying = true;
+                this.log(`开始播放音频队列，队列长度: ${this.audioQueue.length}`, 'info');
+                
+                while (this.audioQueue.length > 0) {
+                    const audioBlob = this.audioQueue.shift();
+                    this.log(`播放音频块，剩余队列长度: ${this.audioQueue.length}`, 'info');
+                    try {
+                        await this.playAudioBlob(audioBlob);
+                        this.log('音频块播放完成', 'success');
+                    } catch (error) {
+                        this.log(`音频播放失败: ${error.message}`, 'error');
+                        break;
+                    }
+                }
+                
+                this.isPlaying = false;
+                this.log('音频队列播放完成', 'success');
+            }
+            
+            async playAudioBlob(audioBlob) {
+                return new Promise((resolve, reject) => {
+                    const audioUrl = URL.createObjectURL(audioBlob);
+                    const audio = new Audio(audioUrl);
+                    
+                    this.log(`创建音频对象，URL: ${audioUrl.substring(0, 50)}...`, 'info');
+                    
+                    audio.onloadstart = () => {
+                        this.log('音频开始加载', 'info');
+                    };
+                    
+                    audio.oncanplay = () => {
+                        this.log('音频可以播放', 'info');
+                    };
+                    
+                    audio.onplay = () => {
+                        this.log('音频开始播放', 'success');
+                    };
+                    
+                    audio.onended = () => {
+                        this.log('音频播放结束', 'info');
+                        URL.revokeObjectURL(audioUrl);
+                        resolve();
+                    };
+                    
+                    audio.onerror = (error) => {
+                        this.log(`音频播放错误: ${error}`, 'error');
+                        URL.revokeObjectURL(audioUrl);
+                        reject(error);
+                    };
+                    
+                    audio.play().then(() => {
+                        this.log('音频play()调用成功', 'success');
+                    }).catch((error) => {
+                        this.log(`音频play()调用失败: ${error.message}`, 'error');
+                        reject(error);
+                    });
+                });
             }
             
             addMessage(sender, content) {
@@ -609,6 +741,9 @@
             
             clearConversation() {
                 this.conversationEl.innerHTML = '<h3>💬 对话历史</h3>';
+                // 清空音频队列
+                this.audioQueue = [];
+                this.isPlaying = false;
                 this.log('对话历史已清空', 'info');
             }
             

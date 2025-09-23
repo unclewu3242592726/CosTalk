@@ -5,6 +5,7 @@ import (
 	
 	"github.com/unclewu3242592726/CosTalk/backend/internal/config"
 	"github.com/unclewu3242592726/CosTalk/backend/pkg/provider"
+	"github.com/zeromicro/go-zero/core/logx"
 )
 
 type ServiceContext struct {
@@ -42,11 +43,15 @@ func NewServiceContext(c config.Config) *ServiceContext {
 	}
 	
 	if iflytekAppID != "" && iflytekAPISecret != "" && iflytekAPIKey != "" {
+		logx.Infof("Registering iFlytek providers with AppID: %s", iflytekAppID)
 		asrProvider := provider.NewIflytekASRProvider(iflytekAppID, iflytekAPISecret, iflytekAPIKey)
 		ttsProvider := provider.NewIflytekTTSProvider(iflytekAppID, iflytekAPISecret, iflytekAPIKey)
 		
 		registry.RegisterASR("iflytek", asrProvider)
 		registry.RegisterTTS("iflytek", ttsProvider)
+	} else {
+		logx.Errorf("iFlytek configuration incomplete: AppID=%s, APISecret=%s, APIKey=%s", 
+			iflytekAppID, iflytekAPISecret, iflytekAPIKey)
 	}
 	
 	// 注册七牛云 LLM/ASR/TTS Provider

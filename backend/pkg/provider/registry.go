@@ -32,7 +32,8 @@ type LLMProvider interface {
 // ASR Provider Interface
 type ASRProvider interface {
 	Name() string
-	StreamRecognize(ctx context.Context, audioStream <-chan []byte) (<-chan *Transcript, error)
+	Recognize(audioData []byte) (string, error) // 批量识别
+	StreamRecognize(ctx context.Context, audioStream <-chan []byte) (<-chan *Transcript, error) // 流式识别（可选）
 }
 
 // TTS Provider Interface

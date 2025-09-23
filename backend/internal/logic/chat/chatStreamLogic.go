@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/unclewu3242592726/CosTalk/backend/internal/svc"
@@ -19,10 +20,28 @@ import (
 	"github.com/zeromicro/go-zero/core/logx"
 )
 
+const (
+	MessageTypeConfig    = "config"
+	MessageTypeText      = "text"
+	MessageTypeAudio     = "audio"
+	MessageTypeAudioFile = "audio_file"
+	MessageTypeBinary    = "binary"
+	MessageTypeASR       = "asr"
+	MessageTypeASRResult = "asr_result"
+	MessageTypeTTS       = "tts"
+	MessageTypeResponse  = "response"
+	MessageTypeError     = "error"
+)
+
 type ChatStreamLogic struct {
 	logx.Logger
 	ctx    context.Context
 	svcCtx *svc.ServiceContext
+	// WebSocket写入互斥锁 - 每个连接一个
+	wsWriteMutex sync.Mutex
+	// TTS队列管理器
+	ttsSequence int32 // 音频序列号
+	ttsMutex    sync.Mutex // TTS序列化锁
 }
 
 func NewChatStreamLogic(ctx context.Context, svcCtx *svc.ServiceContext) *ChatStreamLogic {
@@ -33,16 +52,7 @@ func NewChatStreamLogic(ctx context.Context, svcCtx *svc.ServiceContext) *ChatSt
 	}
 }
 
-// WebSocket 消息类型
-const (
-	MessageTypeAudio    = "audio"    // 音频数据
-	MessageTypeText     = "text"     // 文本消息
-	MessageTypeConfig   = "config"   // 配置信息
-	MessageTypeResponse = "response" // 响应消息
-	MessageTypeError    = "error"    // 错误信息
-	MessageTypeASR      = "asr"      // ASR 识别结果
-	MessageTypeTTS      = "tts"      // TTS 音频结果
-)
+
 
 // WebSocket 消息结构
 type WSMessage struct {
@@ -79,35 +89,14 @@ func (l *ChatStreamLogic) HandleWebSocket(conn *websocket.Conn) {
 	defer conn.Close()
 
 	// 会话状态
-	var (
-		config       ConfigMessage
-		audioStream  = make(chan []byte, 100)
-		textStream   = make(chan string, 10)
-		asrResults   = make(chan *provider.Transcript, 10)
-		ttsResults   = make(chan *provider.AudioChunk, 10)
-		wg           sync.WaitGroup
-		ctx, cancel  = context.WithCancel(l.ctx)
-	)
-	defer cancel()
+	var config ConfigMessage
 
 	// 发送欢迎消息
 	l.sendMessage(conn, &WSMessage{
-		Type:      MessageTypeResponse,
-		Content:   "WebSocket connection established. Please send config first.",
+		Type:      "welcome",
+		Content:   "WebSocket connection established. Send config to start.",
 		Timestamp: time.Now().Unix(),
 	})
-
-	// 启动音频流处理
-	go l.handleAudioStream(ctx, audioStream, asrResults, &config, &wg)
-
-	// 启动文本流处理
-	go l.handleTextStream(ctx, textStream, conn, &config, &wg)
-
-	// 启动 TTS 结果处理
-	go l.handleTTSResults(ctx, ttsResults, conn, &wg)
-
-	// 启动 ASR 结果处理
-	go l.handleASRResults(ctx, asrResults, textStream, conn, &wg)
 
 	// 主消息循环
 	for {
@@ -121,7 +110,7 @@ func (l *ChatStreamLogic) HandleWebSocket(conn *websocket.Conn) {
 
 		switch messageType {
 		case websocket.TextMessage:
-			// 处理JSON消息（原有的消息格式）
+			// 处理JSON消息
 			var msg WSMessage
 			if err := json.Unmarshal(data, &msg); err != nil {
 				l.sendError(conn, 400, "Invalid JSON message: "+err.Error())
@@ -134,72 +123,201 @@ func (l *ChatStreamLogic) HandleWebSocket(conn *websocket.Conn) {
 					l.sendError(conn, 400, err.Error())
 				} else {
 					l.sendMessage(conn, &WSMessage{
-						Type:      MessageTypeResponse,
+						Type:      "config_updated",
 						Content:   "Configuration updated successfully",
 						Timestamp: time.Now().Unix(),
 					})
 				}
 
-			case MessageTypeAudio:
-				if err := l.handleAudioMessage(&msg, audioStream); err != nil {
-					l.sendError(conn, 400, err.Error())
-				}
+			case MessageTypeAudio, MessageTypeAudioFile:
+				// 处理完整音频文件进行ASR（支持audio和audio_file两种类型）
+				go l.handleAudioFile(&msg, &config, conn)
 
 			case MessageTypeText:
-				if err := l.handleTextMessage(&msg, textStream); err != nil {
-					l.sendError(conn, 400, err.Error())
-				}
+				// 直接处理文本输入
+				go l.handleTextInput(&msg, &config, conn)
 
 			default:
 				l.sendError(conn, 400, "Unknown message type: "+msg.Type)
 			}
 
 		case websocket.BinaryMessage:
-			// 处理ASR协议的二进制消息
-			if err := l.handleASRProtocolMessage(data, &config, audioStream); err != nil {
-				logx.Errorf("ASR protocol message error: %v", err)
-				l.sendError(conn, 400, "ASR protocol error: "+err.Error())
-			} else {
-				// 发送ASR协议格式的确认响应
-				ackResponse := map[string]interface{}{
-					"reqid":     fmt.Sprintf("req_%d", time.Now().UnixNano()),
-					"operation": "asr",
-					"result": map[string]interface{}{
-						"text": "",
-						"additions": map[string]interface{}{
-							"duration": "0",
-						},
-					},
-				}
-				if err := l.sendASRResponse(conn, ackResponse); err != nil {
-					logx.Errorf("Failed to send ASR response: %v", err)
-				}
-			}
+			// 处理二进制音频数据
+			go l.handleBinaryAudio(data, &config, conn)
 
 		default:
 			l.sendError(conn, 400, "Unsupported message type")
 		}
 	}
-
-	// 等待所有 goroutine 完成
-	cancel()
-	wg.Wait()
 }
 
-// 处理配置消息
-func (l *ChatStreamLogic) handleConfig(msg *WSMessage, config *ConfigMessage) error {
-	configData, ok := msg.Content.(map[string]interface{})
+// 处理完整音频文件进行ASR识别
+func (l *ChatStreamLogic) handleAudioFile(msg *WSMessage, config *ConfigMessage, conn *websocket.Conn) {
+	// 打印调试信息
+	logx.Infof("Audio message content: %+v", msg.Content)
+	
+	// 解析音频文件数据
+	audioData, ok := msg.Content.(map[string]interface{})
 	if !ok {
-		return fmt.Errorf("invalid config format")
+		l.sendError(conn, 400, "Invalid audio file format")
+		return
 	}
 
-	// 将 map 转换为 ConfigMessage
-	configBytes, err := json.Marshal(configData)
+	// 打印所有字段名以调试
+	logx.Infof("Audio data fields: %v", func() []string {
+		keys := make([]string, 0, len(audioData))
+		for k := range audioData {
+			keys = append(keys, k)
+		}
+		return keys
+	}())
+
+	// 获取音频数据，尝试多种可能的字段名
+	var audioBytes []byte
+	var audioDataRaw interface{}
+	var exists bool
+	
+	// 尝试不同的字段名
+	if audioDataRaw, exists = audioData["audio_data"]; exists {
+		// 使用 audio_data 字段
+	} else if audioDataRaw, exists = audioData["data"]; exists {
+		// 使用 data 字段
+	} else if audioDataRaw, exists = audioData["audioData"]; exists {
+		// 使用 audioData 字段
+	} else if audioDataRaw, exists = audioData["audio"]; exists {
+		// 使用 audio 字段
+	} else {
+		l.sendError(conn, 400, "Missing audio data field (tried: audio_data, data, audioData, audio)")
+		return
+	}
+
+	switch data := audioDataRaw.(type) {
+	case string:
+		// base64 编码的音频数据
+		var err error
+		audioBytes, err = base64.StdEncoding.DecodeString(data)
+		if err != nil {
+			l.sendError(conn, 400, "Failed to decode audio data: "+err.Error())
+			return
+		}
+	case []byte:
+		audioBytes = data
+	case []interface{}:
+		// 处理数字数组（JavaScript Array -> Go []interface{}）
+		audioBytes = make([]byte, len(data))
+		for i, v := range data {
+			if num, ok := v.(float64); ok {
+				audioBytes[i] = byte(num)
+			} else {
+				l.sendError(conn, 400, "Invalid audio data: array contains non-numeric values")
+				return
+			}
+		}
+	default:
+		l.sendError(conn, 400, fmt.Sprintf("Unsupported audio data format: %T", data))
+		return
+	}
+
+	if len(audioBytes) == 0 {
+		l.sendError(conn, 400, "Empty audio data")
+		return
+	}
+
+	logx.Infof("Processing audio file: %d bytes", len(audioBytes))
+
+	// 发送处理状态
+	l.sendMessage(conn, &WSMessage{
+		Type:      "status",
+		Content:   map[string]interface{}{"status": "processing_audio", "message": "正在识别语音..."},
+		Timestamp: time.Now().Unix(),
+	})
+
+	// 调用ASR识别（一次性）
+	text, err := l.performASR(audioBytes, config)
 	if err != nil {
-		return err
+		l.sendError(conn, 500, "ASR failed: "+err.Error())
+		return
 	}
 
-	return json.Unmarshal(configBytes, config)
+	if text == "" {
+		l.sendError(conn, 400, "No text recognized from audio")
+		return
+	}
+
+	logx.Infof("ASR result: '%s'", text)
+
+	// 发送ASR结果
+	l.sendMessage(conn, &WSMessage{
+		Type:      MessageTypeASRResult,
+		Content:   map[string]interface{}{"text": text},
+		Timestamp: time.Now().Unix(),
+	})
+
+	// 继续处理文本 -> LLM -> TTS
+	l.processTextToResponse(text, config, conn)
+}
+
+// 处理文本输入
+func (l *ChatStreamLogic) handleTextInput(msg *WSMessage, config *ConfigMessage, conn *websocket.Conn) {
+	textData, ok := msg.Content.(map[string]interface{})
+	if !ok {
+		l.sendError(conn, 400, "Invalid text format")
+		return
+	}
+
+	text, ok := textData["content"].(string)
+	if !ok {
+		l.sendError(conn, 400, "Missing text content")
+		return
+	}
+
+	if text == "" {
+		l.sendError(conn, 400, "Empty text content")
+		return
+	}
+
+	logx.Infof("Processing text input: '%s'", text)
+
+	// 直接处理文本 -> LLM -> TTS
+	l.processTextToResponse(text, config, conn)
+}
+
+// 处理二进制音频数据
+func (l *ChatStreamLogic) handleBinaryAudio(audioData []byte, config *ConfigMessage, conn *websocket.Conn) {
+	if len(audioData) == 0 {
+		l.sendError(conn, 400, "Empty binary audio data")
+		return
+	}
+
+	logx.Infof("Processing binary audio: %d bytes", len(audioData))
+
+	// 发送处理状态
+	l.sendMessage(conn, &WSMessage{
+		Type:      "status",
+		Content:   map[string]interface{}{"status": "processing_audio", "message": "正在识别语音..."},
+		Timestamp: time.Now().Unix(),
+	})
+
+	// 调用ASR识别
+	text, err := l.performASR(audioData, config)
+	if err != nil {
+		l.sendError(conn, 500, "ASR failed: "+err.Error())
+		return
+	}
+
+	if text == "" {
+		l.sendError(conn, 400, "No text recognized from audio")
+		return
+	}
+
+	// 发送ASR结果并继续处理
+	l.sendMessage(conn, &WSMessage{
+		Type:      MessageTypeASRResult,
+		Content:   map[string]interface{}{"text": text},
+		Timestamp: time.Now().Unix(),
+	})
+
+	l.processTextToResponse(text, config, conn)
 }
 
 // 处理音频消息
@@ -296,7 +414,7 @@ func (l *ChatStreamLogic) handleAudioStream(ctx context.Context, audioStream <-c
 	// 获取 ASR Provider
 	asrProvider := config.ASRProvider
 	if asrProvider == "" {
-		asrProvider = "qiniu" // 默认使用七牛云
+		asrProvider = "iflytek" // 默认使用讯飞ASR（更稳定）
 	}
 
 	asrProviderInstance, err := l.svcCtx.Registry.GetASR(asrProvider)
@@ -348,7 +466,7 @@ func (l *ChatStreamLogic) handleAudioStream(ctx context.Context, audioStream <-c
 	}
 }
 
-// 处理文本流 -> LLM -> TTS
+// 处理文本流 -> LLM -> TTS (支持流式处理)
 func (l *ChatStreamLogic) handleTextStream(ctx context.Context, textStream <-chan string, conn *websocket.Conn, config *ConfigMessage, wg *sync.WaitGroup) {
 	wg.Add(1)
 	defer wg.Done()
@@ -364,31 +482,8 @@ func (l *ChatStreamLogic) handleTextStream(ctx context.Context, textStream <-cha
 
 			logx.Infof("LLM输入文本: '%s'", text)
 
-			// 调用 LLM
-			llmResponse, err := l.callLLM(ctx, text, config)
-			if err != nil {
-				logx.Errorf("LLM call failed: %v", err)
-				l.sendError(conn, 500, "LLM processing failed: "+err.Error())
-				continue
-			}
-
-			logx.Infof("LLM输出响应: '%s'", llmResponse)
-
-			// 发送 LLM 响应
-			l.sendMessage(conn, &WSMessage{
-				Type: MessageTypeResponse,
-				Content: map[string]interface{}{
-					"text": llmResponse,
-					"type": "llm_response",
-				},
-				Timestamp: time.Now().Unix(),
-			})
-
-			// 调用 TTS
-			if err := l.callTTS(ctx, llmResponse, config, conn); err != nil {
-				logx.Errorf("TTS call failed: %v", err)
-				l.sendError(conn, 500, "TTS processing failed: "+err.Error())
-			}
+			// 启动流式LLM处理
+			go l.processStreamingLLM(ctx, text, config, conn)
 		}
 	}
 }
@@ -461,6 +556,251 @@ func (l *ChatStreamLogic) handleTTSResults(ctx context.Context, ttsResults <-cha
 				Timestamp: time.Now().Unix(),
 			})
 		}
+	}
+}
+
+// 流式LLM处理 - 支持逐句TTS
+func (l *ChatStreamLogic) processStreamingLLM(ctx context.Context, text string, config *ConfigMessage, conn *websocket.Conn) {
+	llmProvider := config.LLMProvider
+	if llmProvider == "" {
+		llmProvider = "qiniu" // 默认使用七牛云
+	}
+
+	llmProviderInstance, err := l.svcCtx.Registry.GetLLM(llmProvider)
+	if err != nil {
+		logx.Errorf("Failed to get LLM provider %s: %v", llmProvider, err)
+		l.sendError(conn, 500, "LLM provider not available: "+err.Error())
+		return
+	}
+
+	// 构建聊天请求
+	messages := []*provider.Message{
+		{Role: "user", Content: text},
+	}
+
+	if config.Role != "" {
+		messages = []*provider.Message{
+			{Role: "system", Content: config.Role},
+			{Role: "user", Content: text},
+		}
+	}
+
+	// 启用流式处理
+	req := &provider.ChatRequest{
+		Model:    "deepseek-v3", // 使用七牛云支持的模型
+		Messages: messages,
+		Stream:   true, // 关键：启用流式处理
+	}
+
+	// 调用流式LLM
+	streamChan, err := llmProviderInstance.ChatStream(ctx, req)
+	if err != nil {
+		logx.Errorf("LLM stream call failed: %v", err)
+		l.sendError(conn, 500, "LLM stream processing failed: "+err.Error())
+		return
+	}
+
+	var (
+		accumulatedText = ""
+		sentenceBuffer  = ""
+		isFirstChunk    = true
+	)
+
+	for chunk := range streamChan {
+		if chunk.Text == "" {
+			continue
+		}
+
+		accumulatedText += chunk.Text
+		sentenceBuffer += chunk.Text
+
+		// 发送实时流式响应给客户端
+		l.sendMessage(conn, &WSMessage{
+			Type: MessageTypeResponse,
+			Content: map[string]interface{}{
+				"text":        chunk.Text,
+				"type":        "llm_stream",
+				"accumulated": accumulatedText,
+				"is_first":    isFirstChunk,
+				"is_done":     false,
+			},
+			Timestamp: time.Now().Unix(),
+		})
+
+		isFirstChunk = false
+
+		// 检查是否完成了一个句子（以句号、问号、感叹号结尾）
+		if l.isSentenceComplete(sentenceBuffer) {
+			logx.Infof("检测到完整句子，启动TTS: '%s'", sentenceBuffer)
+			
+			// 序列化处理TTS，确保音频按顺序播放
+			l.callSequentialTTS(ctx, sentenceBuffer, config, conn)
+			
+			sentenceBuffer = "" // 清空句子缓冲区
+		}
+	}
+
+	// 处理最后可能剩余的文本
+	if sentenceBuffer != "" {
+		logx.Infof("处理剩余文本TTS: '%s'", sentenceBuffer)
+		l.callSequentialTTS(ctx, sentenceBuffer, config, conn)
+	}
+
+	// 发送完成标志
+	l.sendMessage(conn, &WSMessage{
+		Type: MessageTypeResponse,
+		Content: map[string]interface{}{
+			"text":        "",
+			"type":        "llm_stream",
+			"accumulated": accumulatedText,
+			"is_first":    false,
+			"is_done":     true,
+		},
+		Timestamp: time.Now().Unix(),
+	})
+
+	logx.Infof("LLM流式处理完成，总文本: '%s'", accumulatedText)
+}
+
+// 判断句子是否完整
+func (l *ChatStreamLogic) isSentenceComplete(text string) bool {
+	if len(text) < 2 {
+		return false
+	}
+	
+	// 检查中文和英文的句子结束符
+	lastChar := text[len(text)-1:]
+	return lastChar == "。" || lastChar == "？" || lastChar == "！" || 
+		   lastChar == "." || lastChar == "?" || lastChar == "!" ||
+		   lastChar == "\n"
+}
+
+// 流式TTS处理
+// callSequentialTTS 序列化TTS处理，确保音频按顺序播放
+func (l *ChatStreamLogic) callSequentialTTS(ctx context.Context, text string, config *ConfigMessage, conn *websocket.Conn) {
+	// 使用TTS互斥锁确保串行处理
+	l.ttsMutex.Lock()
+	defer l.ttsMutex.Unlock()
+	
+	ttsProvider := config.TTSProvider
+	if ttsProvider == "" {
+		ttsProvider = "qiniu" // 默认使用七牛云
+	}
+
+	ttsProviderInstance, err := l.svcCtx.Registry.GetTTS(ttsProvider)
+	if err != nil {
+		logx.Errorf("Failed to get TTS provider %s: %v", ttsProvider, err)
+		return
+	}
+
+	// 创建文本流通道
+	textStreamChan := make(chan string, 1)
+	textStreamChan <- text
+	close(textStreamChan)
+
+	// TTS 选项
+	opts := &provider.TTSOptions{
+		Voice: config.Voice,
+		Speed: config.Speed,
+	}
+	if opts.Voice == "" {
+		opts.Voice = "qiniu_zh_female_wwxkjx"
+	}
+	if opts.Speed == 0 {
+		opts.Speed = 1.0
+	}
+
+	// 调用 TTS
+	audioChunkChan, err := ttsProviderInstance.SynthesizeStream(ctx, textStreamChan, opts)
+	if err != nil {
+		logx.Errorf("TTS stream call failed: %v", err)
+		return
+	}
+
+	// 流式发送音频块，使用全局序列号
+	for audioChunk := range audioChunkChan {
+		if audioChunk == nil {
+			continue
+		}
+
+		// 获取并递增序列号
+		seqNumber := atomic.AddInt32(&l.ttsSequence, 1)
+
+		logx.Infof("发送TTS音频块: %d bytes, format: %s, seq: %d", 
+			len(audioChunk.Data), audioChunk.Format, seqNumber)
+
+		// 发送音频块给客户端
+		l.sendMessage(conn, &WSMessage{
+			Type: MessageTypeTTS,
+			Content: map[string]interface{}{
+				"audio":     base64.StdEncoding.EncodeToString(audioChunk.Data),
+				"format":    audioChunk.Format,
+				"sequence":  seqNumber,
+				"text":      text, // 关联的文本
+			},
+			Timestamp: time.Now().Unix(),
+		})
+	}
+	
+	logx.Infof("TTS序列化处理完成: %s", text)
+}
+
+func (l *ChatStreamLogic) callStreamTTS(ctx context.Context, text string, config *ConfigMessage, conn *websocket.Conn) {
+	ttsProvider := config.TTSProvider
+	if ttsProvider == "" {
+		ttsProvider = "qiniu" // 默认使用七牛云
+	}
+
+	ttsProviderInstance, err := l.svcCtx.Registry.GetTTS(ttsProvider)
+	if err != nil {
+		logx.Errorf("Failed to get TTS provider %s: %v", ttsProvider, err)
+		return
+	}
+
+	// 创建文本流通道
+	textStreamChan := make(chan string, 1)
+	textStreamChan <- text
+	close(textStreamChan)
+
+	// TTS 选项
+	opts := &provider.TTSOptions{
+		Voice: config.Voice,
+		Speed: config.Speed,
+	}
+	if opts.Voice == "" {
+		opts.Voice = "qiniu_zh_female_wwxkjx"
+	}
+	if opts.Speed == 0 {
+		opts.Speed = 1.0
+	}
+
+	// 调用 TTS
+	audioChunkChan, err := ttsProviderInstance.SynthesizeStream(ctx, textStreamChan, opts)
+	if err != nil {
+		logx.Errorf("TTS stream call failed: %v", err)
+		return
+	}
+
+	// 立即流式发送音频块，不等待完整音频
+	for audioChunk := range audioChunkChan {
+		if audioChunk == nil {
+			continue
+		}
+
+		logx.Infof("发送TTS音频块: %d bytes, format: %s, seq: %d", 
+			len(audioChunk.Data), audioChunk.Format, audioChunk.SeqNum)
+
+		l.sendMessage(conn, &WSMessage{
+			Type: MessageTypeTTS,
+			Content: map[string]interface{}{
+				"audio_data": audioChunk.Data,
+				"format":     audioChunk.Format,
+				"seq_num":    audioChunk.SeqNum,
+				"text":       text, // 包含对应的文本
+				"streaming":  true,
+			},
+			Timestamp: time.Now().Unix(),
+		})
 	}
 }
 
@@ -567,8 +907,11 @@ func (l *ChatStreamLogic) callTTS(ctx context.Context, text string, config *Conf
 	return nil
 }
 
-// 发送消息
+// 发送消息 - 使用互斥锁确保线程安全
 func (l *ChatStreamLogic) sendMessage(conn *websocket.Conn, msg *WSMessage) {
+	l.wsWriteMutex.Lock()
+	defer l.wsWriteMutex.Unlock()
+	
 	if err := conn.WriteJSON(msg); err != nil {
 		logx.Errorf("Failed to send WebSocket message: %v", err)
 	}
@@ -822,4 +1165,83 @@ func (l *ChatStreamLogic) handleASRAudioOnlyRequest(payload []byte, audioStream 
 	default:
 		return fmt.Errorf("audio stream buffer full")
 	}
+}
+
+// 处理配置消息
+func (l *ChatStreamLogic) handleConfig(msg *WSMessage, config *ConfigMessage) error {
+	configData, ok := msg.Content.(map[string]interface{})
+	if !ok {
+		return fmt.Errorf("invalid config format")
+	}
+
+	// 将 map 转换为 ConfigMessage
+	configBytes, err := json.Marshal(configData)
+	if err != nil {
+		return err
+	}
+
+	return json.Unmarshal(configBytes, config)
+}
+
+// 执行ASR识别
+func (l *ChatStreamLogic) performASR(audioData []byte, config *ConfigMessage) (string, error) {
+	// 设置默认ASR提供商
+	asrProviderName := config.ASRProvider
+	if asrProviderName == "" {
+		asrProviderName = "iflytek" // 使用iFlytek作为默认ASR
+	}
+	
+	logx.Infof("Using ASR provider: %s (configured: %s)", asrProviderName, config.ASRProvider)
+	
+	asrProvider, err := l.svcCtx.Registry.GetASR(asrProviderName)
+	if err != nil {
+		// 如果指定的provider不可用，尝试备选方案
+		logx.Errorf("ASR provider '%s' not found: %v, trying fallback", asrProviderName, err)
+		
+		// 尝试备选provider
+		fallbackProviders := []string{"iflytek", "qiniu"}
+		for _, fallback := range fallbackProviders {
+			if fallback != asrProviderName {
+				logx.Infof("Trying fallback ASR provider: %s", fallback)
+				asrProvider, err = l.svcCtx.Registry.GetASR(fallback)
+				if err == nil {
+					asrProviderName = fallback
+					break
+				}
+			}
+		}
+		
+		if err != nil {
+			return "", fmt.Errorf("no ASR provider available: %v", err)
+		}
+	}
+
+	// 使用批量识别接口
+	logx.Infof("Calling ASR provider '%s' with %d bytes of audio data", asrProviderName, len(audioData))
+	text, err := asrProvider.Recognize(audioData)
+	if err != nil {
+		return "", fmt.Errorf("ASR recognition failed: %v", err)
+	}
+	
+	logx.Infof("ASR result: %s", text)
+	return text, nil
+}
+
+// 处理文本到响应的完整流程（LLM + TTS）
+func (l *ChatStreamLogic) processTextToResponse(text string, config *ConfigMessage, conn *websocket.Conn) {
+	// 发送处理状态
+	l.sendMessage(conn, &WSMessage{
+		Type:      "status",
+		Content:   map[string]interface{}{"status": "processing_llm", "message": "正在生成回复..."},
+		Timestamp: time.Now().Unix(),
+	})
+
+	// 调用LLM获取回复（流式）
+	go l.processLLMStreaming(text, config, conn)
+}
+
+// 处理LLM流式生成
+func (l *ChatStreamLogic) processLLMStreaming(text string, config *ConfigMessage, conn *websocket.Conn) {
+	ctx := context.Background()
+	l.processStreamingLLM(ctx, text, config, conn)
 }
